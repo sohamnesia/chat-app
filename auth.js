@@ -1,36 +1,46 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { Resend } = require('resend');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_in_production';
 const JWT_EXPIRES = '7d';
 
-// ─── In-memory stores (swap for DB in production) ───────────
+// In-memory stores (swap for DB in production)
 // accounts: email -> { name, passwordHash, color, verified, createdAt }
 const accounts = {};
-// otps:     email -> { code, expiresAt, type: 'verify'|'reset' }
+// otps: email -> { code, expiresAt, type: 'verify'|'reset' }
 const otps = {};
 
 const COLORS = [
-  '#3B82F6','#10B981','#F59E0B','#EF4444','#8B5CF6',
-  '#EC4899','#06B6D4','#84CC16','#F97316','#6366F1'
+  '#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6',
+  '#EC4899', '#06B6D4', '#84CC16', '#F97316', '#6366F1',
 ];
 let colorIdx = 0;
 
-// ─── Resend email sender ─────────────────────────────────────
+// Brevo email sender
 async function sendOtpEmail(toEmail, code, type) {
-  const resend = new Resend(process.env.RESEND_API_KEY);
+  const apiKey = process.env.BREVO_API_KEY;
+  if (!apiKey) throw new Error('BREVO_API_KEY is not set');
+
+  const senderEmail = process.env.BREVO_SENDER_EMAIL || 'no-reply@example.com';
+  const senderName = process.env.BREVO_SENDER_NAME || 'Chat App';
   const isVerify = type === 'verify';
   const subject = isVerify ? 'Verify your Chat account' : 'Reset your Chat password';
-  const action  = isVerify ? 'verify your email address' : 'reset your password';
+  const action = isVerify ? 'verify your email address' : 'reset your password';
 
-  const { error } = await resend.emails.send({
-    from: 'Chat App <onboarding@resend.dev>', // works without a custom domain
-    to: toEmail,
-    subject,
-    html: `
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'api-key': apiKey,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { name: senderName, email: senderEmail },
+      to: [{ email: toEmail }],
+      subject,
+      htmlContent: `
       <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0f1117;color:#e8eaf0;border-radius:16px;padding:40px 36px;">
-        <h2 style="margin:0 0 8px;font-size:22px;">💬 Chat App</h2>
+        <h2 style="margin:0 0 8px;font-size:22px;">Chat App</h2>
         <p style="color:#7a7f96;margin:0 0 32px;font-size:14px;">Your one-time code to ${action}</p>
         <div style="background:#1a1d27;border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:28px;text-align:center;margin-bottom:28px;">
           <span style="font-size:40px;font-weight:700;letter-spacing:14px;color:#5b6ef5;">${code}</span>
@@ -38,12 +48,15 @@ async function sendOtpEmail(toEmail, code, type) {
         <p style="color:#7a7f96;font-size:13px;margin:0;">This code expires in <strong style="color:#e8eaf0;">10 minutes</strong>. Don't share it with anyone.</p>
       </div>
     `,
+    }),
   });
 
-  if (error) throw new Error(error.message);
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`Brevo send failed (${response.status}): ${details}`);
+  }
 }
 
-// ─── OTP helpers ────────────────────────────────────────────
 function generateOtp() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
@@ -56,42 +69,50 @@ function verifyOtp(email, code, type) {
   const otp = otps[email];
   if (!otp) return { ok: false, msg: 'No OTP found. Request a new one.' };
   if (otp.type !== type) return { ok: false, msg: 'Wrong OTP type.' };
-  if (Date.now() > otp.expiresAt) { delete otps[email]; return { ok: false, msg: 'OTP expired. Request a new one.' }; }
+  if (Date.now() > otp.expiresAt) {
+    delete otps[email];
+    return { ok: false, msg: 'OTP expired. Request a new one.' };
+  }
   if (otp.code !== code.trim()) return { ok: false, msg: 'Incorrect OTP.' };
   delete otps[email];
   return { ok: true };
 }
 
-// ─── JWT ────────────────────────────────────────────────────
 function signToken(email) {
   return jwt.sign({ email }, JWT_SECRET, { expiresIn: JWT_EXPIRES });
 }
 
 function verifyToken(token) {
-  try { return jwt.verify(token, JWT_SECRET); }
-  catch { return null; }
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch {
+    return null;
+  }
 }
 
-// ─── Auth routes factory ─────────────────────────────────────
 function mountAuthRoutes(app) {
   const express = require('express');
   app.use(express.json());
 
-  // POST /auth/register  { email, name, password }
   app.post('/auth/register', async (req, res) => {
     const { email, name, password } = req.body || {};
-    if (!email || !name || !password)
+    if (!email || !name || !password) {
       return res.json({ ok: false, msg: 'Email, name and password are required.' });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.json({ ok: false, msg: 'Invalid email address.' });
-    if (name.trim().length < 2)
+    }
+    if (name.trim().length < 2) {
       return res.json({ ok: false, msg: 'Name must be at least 2 characters.' });
-    if (password.length < 6)
+    }
+    if (password.length < 6) {
       return res.json({ ok: false, msg: 'Password must be at least 6 characters.' });
+    }
 
     const key = email.toLowerCase();
-    if (accounts[key] && accounts[key].verified)
+    if (accounts[key] && accounts[key].verified) {
       return res.json({ ok: false, msg: 'Email already registered. Please log in.' });
+    }
 
     const passwordHash = await bcrypt.hash(password, 10);
     accounts[key] = {
@@ -109,13 +130,12 @@ function mountAuthRoutes(app) {
       await sendOtpEmail(key, code, 'verify');
     } catch (e) {
       console.error('Email send failed:', e.message);
-      return res.json({ ok: false, msg: 'Failed to send OTP email. Check your RESEND_API_KEY in Railway.' });
+      return res.json({ ok: false, msg: 'Failed to send OTP email. Check your Brevo env vars.' });
     }
 
-    res.json({ ok: true, msg: 'OTP sent to your email.' });
+    return res.json({ ok: true, msg: 'OTP sent to your email.' });
   });
 
-  // POST /auth/verify-otp  { email, code }
   app.post('/auth/verify-otp', (req, res) => {
     const { email, code } = req.body || {};
     const key = email?.toLowerCase();
@@ -127,10 +147,9 @@ function mountAuthRoutes(app) {
 
     accounts[key].verified = true;
     const token = signToken(key);
-    res.json({ ok: true, token, name: accounts[key].name, color: accounts[key].color });
+    return res.json({ ok: true, token, name: accounts[key].name, color: accounts[key].color });
   });
 
-  // POST /auth/login  { email, password }
   app.post('/auth/login', async (req, res) => {
     const { email, password } = req.body || {};
     const key = email?.toLowerCase();
@@ -144,26 +163,28 @@ function mountAuthRoutes(app) {
     if (!match) return res.json({ ok: false, msg: 'Incorrect password.' });
 
     const token = signToken(key);
-    res.json({ ok: true, token, name: acc.name, color: acc.color });
+    return res.json({ ok: true, token, name: acc.name, color: acc.color });
   });
 
-  // POST /auth/forgot  { email }
   app.post('/auth/forgot', async (req, res) => {
     const key = req.body?.email?.toLowerCase();
     if (!key) return res.json({ ok: false, msg: 'Email required.' });
     const acc = accounts[key];
-    if (!acc || !acc.verified)
-      return res.json({ ok: true, msg: 'If that email exists, a reset code was sent.' }); // don't leak
+    if (!acc || !acc.verified) {
+      return res.json({ ok: true, msg: 'If that email exists, a reset code was sent.' });
+    }
 
     const code = generateOtp();
     storeOtp(key, code, 'reset');
-    try { await sendOtpEmail(key, code, 'reset'); }
-    catch (e) { console.error('Email error:', e.message); }
+    try {
+      await sendOtpEmail(key, code, 'reset');
+    } catch (e) {
+      console.error('Email error:', e.message);
+    }
 
-    res.json({ ok: true, msg: 'If that email exists, a reset code was sent.' });
+    return res.json({ ok: true, msg: 'If that email exists, a reset code was sent.' });
   });
 
-  // POST /auth/reset  { email, code, newPassword }
   app.post('/auth/reset', async (req, res) => {
     const { email, code, newPassword } = req.body || {};
     const key = email?.toLowerCase();
@@ -174,10 +195,9 @@ function mountAuthRoutes(app) {
     if (!check.ok) return res.json(check);
 
     accounts[key].passwordHash = await bcrypt.hash(newPassword, 10);
-    res.json({ ok: true, msg: 'Password reset! You can now log in.' });
+    return res.json({ ok: true, msg: 'Password reset! You can now log in.' });
   });
 
-  // POST /auth/resend  { email }
   app.post('/auth/resend', async (req, res) => {
     const key = req.body?.email?.toLowerCase();
     if (!key || !accounts[key]) return res.json({ ok: false, msg: 'Account not found.' });
@@ -185,9 +205,12 @@ function mountAuthRoutes(app) {
 
     const code = generateOtp();
     storeOtp(key, code, 'verify');
-    try { await sendOtpEmail(key, code, 'verify'); }
-    catch (e) { return res.json({ ok: false, msg: 'Failed to send email.' }); }
-    res.json({ ok: true, msg: 'New OTP sent.' });
+    try {
+      await sendOtpEmail(key, code, 'verify');
+    } catch {
+      return res.json({ ok: false, msg: 'Failed to send email.' });
+    }
+    return res.json({ ok: true, msg: 'New OTP sent.' });
   });
 }
 
