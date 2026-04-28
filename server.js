@@ -19,7 +19,7 @@ const messages = [];    // last 100 messages
 
 function getOnlineList() {
   return Object.entries(onlineUsers).map(([id, u]) => ({
-    id, name: u.name, color: u.color
+    id, email: u.email, name: u.name, color: u.color, avatar: u.avatar || ''
   }));
 }
 
@@ -44,9 +44,17 @@ io.on('connection', (socket) => {
       email: payload.email,
       name: acc.name,
       color: acc.color,
+      avatar: acc.avatar || '',
+      isAdmin: !!acc.isAdmin,
     };
 
-    socket.emit('auth_ok', { name: acc.name, color: acc.color });
+    socket.emit('auth_ok', {
+      email: payload.email,
+      name: acc.name,
+      color: acc.color,
+      avatar: acc.avatar || '',
+      isAdmin: !!acc.isAdmin,
+    });
     socket.emit('history', messages.slice(-60));
     io.emit('online_users', getOnlineList());
     io.emit('system_message', { text: `${acc.name} joined the chat`, ts: Date.now() });
@@ -63,6 +71,7 @@ io.on('connection', (socket) => {
       id: Date.now() + Math.random(),
       socketId: socket.id,
       name: user.name,
+      avatar: user.avatar || '',
       color: user.color,
       text: text.trim().slice(0, 1000),
       ts: Date.now(),
@@ -78,6 +87,14 @@ io.on('connection', (socket) => {
     const user = onlineUsers[socket.id];
     if (!user) return;
     socket.broadcast.emit('typing', { socketId: socket.id, name: user.name, isTyping });
+  });
+
+  socket.on('profile_updated', ({ name, avatar }) => {
+    const user = onlineUsers[socket.id];
+    if (!user) return;
+    if (typeof name === 'string' && name.trim()) user.name = name.trim().slice(0, 24);
+    if (typeof avatar === 'string') user.avatar = avatar;
+    io.emit('online_users', getOnlineList());
   });
 
   // Disconnect

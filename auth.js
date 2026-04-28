@@ -4,6 +4,12 @@ const https = require('https');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_in_production';
 const JWT_EXPIRES = '7d';
+const ADMIN_EMAILS = new Set(
+  String(process.env.ADMIN_EMAILS || '')
+    .split(',')
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean)
+);
 
 // In-memory stores (swap for DB in production)
 // accounts: email -> { name, passwordHash, color, verified, createdAt }
@@ -109,9 +115,34 @@ function verifyToken(token) {
   }
 }
 
+function sanitizeName(name) {
+  return String(name || '').trim().slice(0, 24);
+}
+
+function sanitizeAvatar(avatar) {
+  const raw = String(avatar || '').trim();
+  if (!raw) return '';
+  const isHttp = /^https?:\/\/\S+$/i.test(raw);
+  const isDataImage = /^data:image\/(png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=\s]+$/i.test(raw);
+  if (!isHttp && !isDataImage) return null;
+  if (raw.length > 400000) return null;
+  return raw;
+}
+
+function isAdminEmail(email) {
+  return ADMIN_EMAILS.has(String(email || '').toLowerCase());
+}
+
 function mountAuthRoutes(app) {
   const express = require('express');
   app.use(express.json());
+
+  function authFromReq(req) {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+    if (!token) return null;
+    return verifyToken(token);
+  }
 
   app.post('/auth/register', async (req, res) => {
     const { email, name, password } = req.body || {};
@@ -135,9 +166,11 @@ function mountAuthRoutes(app) {
 
     const passwordHash = await bcrypt.hash(password, 10);
     accounts[key] = {
-      name: name.trim().slice(0, 24),
+      name: sanitizeName(name),
       passwordHash,
       color: COLORS[colorIdx++ % COLORS.length],
+      avatar: '',
+      isAdmin: isAdminEmail(key),
       verified: false,
       createdAt: Date.now(),
     };
@@ -166,7 +199,15 @@ function mountAuthRoutes(app) {
 
     accounts[key].verified = true;
     const token = signToken(key);
-    return res.json({ ok: true, token, name: accounts[key].name, color: accounts[key].color });
+    return res.json({
+      ok: true,
+      token,
+      email: key,
+      name: accounts[key].name,
+      color: accounts[key].color,
+      avatar: accounts[key].avatar || '',
+      isAdmin: !!accounts[key].isAdmin,
+    });
   });
 
   app.post('/auth/login', async (req, res) => {
@@ -182,7 +223,15 @@ function mountAuthRoutes(app) {
     if (!match) return res.json({ ok: false, msg: 'Incorrect password.' });
 
     const token = signToken(key);
-    return res.json({ ok: true, token, name: acc.name, color: acc.color });
+    return res.json({
+      ok: true,
+      token,
+      email: key,
+      name: acc.name,
+      color: acc.color,
+      avatar: acc.avatar || '',
+      isAdmin: !!acc.isAdmin,
+    });
   });
 
   app.post('/auth/forgot', async (req, res) => {
@@ -231,6 +280,123 @@ function mountAuthRoutes(app) {
       return res.json({ ok: false, msg: `Failed to send email: ${e.message}` });
     }
     return res.json({ ok: true, msg: 'New OTP sent.' });
+  });
+
+  app.get('/auth/me', (req, res) => {
+    const payload = authFromReq(req);
+    if (!payload) return res.status(401).json({ ok: false, msg: 'Unauthorized.' });
+    const key = payload.email?.toLowerCase();
+    const acc = accounts[key];
+    if (!acc || !acc.verified) return res.status(401).json({ ok: false, msg: 'Unauthorized.' });
+    return res.json({
+      ok: true,
+      user: {
+        email: key,
+        name: acc.name,
+        color: acc.color,
+        avatar: acc.avatar || '',
+        isAdmin: !!acc.isAdmin,
+        verified: !!acc.verified,
+        createdAt: acc.createdAt,
+      },
+    });
+  });
+
+  app.post('/auth/profile', (req, res) => {
+    const payload = authFromReq(req);
+    if (!payload) return res.status(401).json({ ok: false, msg: 'Unauthorized.' });
+    const key = payload.email?.toLowerCase();
+    const acc = accounts[key];
+    if (!acc || !acc.verified) return res.status(401).json({ ok: false, msg: 'Unauthorized.' });
+
+    const nextName = sanitizeName(req.body?.name);
+    if (!nextName || nextName.length < 2) {
+      return res.json({ ok: false, msg: 'Name must be at least 2 characters.' });
+    }
+
+    const nextAvatar = sanitizeAvatar(req.body?.avatar);
+    if (nextAvatar === null) {
+      return res.json({ ok: false, msg: 'Avatar must be an image URL or image file.' });
+    }
+
+    acc.name = nextName;
+    acc.avatar = nextAvatar;
+
+    return res.json({
+      ok: true,
+      user: {
+        email: key,
+        name: acc.name,
+        color: acc.color,
+        avatar: acc.avatar || '',
+        isAdmin: !!acc.isAdmin,
+        verified: !!acc.verified,
+      },
+    });
+  });
+
+  app.get('/admin/accounts', (req, res) => {
+    const payload = authFromReq(req);
+    if (!payload) return res.status(401).json({ ok: false, msg: 'Unauthorized.' });
+    const caller = accounts[payload.email?.toLowerCase()];
+    if (!caller?.verified || !caller?.isAdmin) {
+      return res.status(403).json({ ok: false, msg: 'Admin access required.' });
+    }
+
+    const items = Object.entries(accounts).map(([email, acc]) => ({
+      email,
+      name: acc.name,
+      color: acc.color,
+      avatar: acc.avatar || '',
+      verified: !!acc.verified,
+      isAdmin: !!acc.isAdmin,
+      createdAt: acc.createdAt,
+    }));
+    return res.json({ ok: true, accounts: items });
+  });
+
+  app.post('/admin/account/update', (req, res) => {
+    const payload = authFromReq(req);
+    if (!payload) return res.status(401).json({ ok: false, msg: 'Unauthorized.' });
+    const callerKey = payload.email?.toLowerCase();
+    const caller = accounts[callerKey];
+    if (!caller?.verified || !caller?.isAdmin) {
+      return res.status(403).json({ ok: false, msg: 'Admin access required.' });
+    }
+
+    const key = String(req.body?.email || '').toLowerCase();
+    const acc = accounts[key];
+    if (!key || !acc) return res.json({ ok: false, msg: 'Account not found.' });
+
+    const nextName = sanitizeName(req.body?.name);
+    if (!nextName || nextName.length < 2) return res.json({ ok: false, msg: 'Invalid name.' });
+    const nextAvatar = sanitizeAvatar(req.body?.avatar);
+    if (nextAvatar === null) return res.json({ ok: false, msg: 'Invalid avatar format.' });
+
+    acc.name = nextName;
+    acc.avatar = nextAvatar;
+    acc.verified = Boolean(req.body?.verified);
+    acc.isAdmin = Boolean(req.body?.isAdmin);
+
+    return res.json({ ok: true });
+  });
+
+  app.post('/admin/account/delete', (req, res) => {
+    const payload = authFromReq(req);
+    if (!payload) return res.status(401).json({ ok: false, msg: 'Unauthorized.' });
+    const callerKey = payload.email?.toLowerCase();
+    const caller = accounts[callerKey];
+    if (!caller?.verified || !caller?.isAdmin) {
+      return res.status(403).json({ ok: false, msg: 'Admin access required.' });
+    }
+
+    const key = String(req.body?.email || '').toLowerCase();
+    if (!key || !accounts[key]) return res.json({ ok: false, msg: 'Account not found.' });
+    if (key === callerKey) return res.json({ ok: false, msg: 'You cannot delete your own account.' });
+
+    delete accounts[key];
+    delete otps[key];
+    return res.json({ ok: true });
   });
 }
 
