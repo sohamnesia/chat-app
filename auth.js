@@ -1,6 +1,6 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_in_production';
 const JWT_EXPIRES = '7d';
@@ -17,25 +17,15 @@ const COLORS = [
 ];
 let colorIdx = 0;
 
-// ─── Email transporter ──────────────────────────────────────
-function createTransporter() {
-  return nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.GMAIL_USER,
-      pass: process.env.GMAIL_APP_PASSWORD,
-    },
-  });
-}
-
+// ─── Resend email sender ─────────────────────────────────────
 async function sendOtpEmail(toEmail, code, type) {
-  const transporter = createTransporter();
+  const resend = new Resend(process.env.RESEND_API_KEY);
   const isVerify = type === 'verify';
   const subject = isVerify ? 'Verify your Chat account' : 'Reset your Chat password';
   const action  = isVerify ? 'verify your email address' : 'reset your password';
 
-  await transporter.sendMail({
-    from: `"💬 Chat App" <${process.env.GMAIL_USER}>`,
+  const { error } = await resend.emails.send({
+    from: 'Chat App <onboarding@resend.dev>', // works without a custom domain
     to: toEmail,
     subject,
     html: `
@@ -49,6 +39,8 @@ async function sendOtpEmail(toEmail, code, type) {
       </div>
     `,
   });
+
+  if (error) throw new Error(error.message);
 }
 
 // ─── OTP helpers ────────────────────────────────────────────
@@ -117,7 +109,7 @@ function mountAuthRoutes(app) {
       await sendOtpEmail(key, code, 'verify');
     } catch (e) {
       console.error('Email send failed:', e.message);
-      return res.json({ ok: false, msg: 'Failed to send OTP email. Check your GMAIL config in .env' });
+      return res.json({ ok: false, msg: 'Failed to send OTP email. Check your RESEND_API_KEY in Railway.' });
     }
 
     res.json({ ok: true, msg: 'OTP sent to your email.' });
