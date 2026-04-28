@@ -1,5 +1,6 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const https = require('https');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_in_production';
 const JWT_EXPIRES = '7d';
@@ -21,24 +22,18 @@ async function sendOtpEmail(toEmail, code, type) {
   const apiKey = process.env.BREVO_API_KEY;
   if (!apiKey) throw new Error('BREVO_API_KEY is not set');
 
-  const senderEmail = process.env.BREVO_SENDER_EMAIL || 'no-reply@example.com';
+  const senderEmail = process.env.BREVO_SENDER_EMAIL;
+  if (!senderEmail) throw new Error('BREVO_SENDER_EMAIL is not set');
   const senderName = process.env.BREVO_SENDER_NAME || 'Chat App';
   const isVerify = type === 'verify';
   const subject = isVerify ? 'Verify your Chat account' : 'Reset your Chat password';
   const action = isVerify ? 'verify your email address' : 'reset your password';
 
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: {
-      accept: 'application/json',
-      'api-key': apiKey,
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      sender: { name: senderName, email: senderEmail },
-      to: [{ email: toEmail }],
-      subject,
-      htmlContent: `
+  const payload = JSON.stringify({
+    sender: { name: senderName, email: senderEmail },
+    to: [{ email: toEmail }],
+    subject,
+    htmlContent: `
       <div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0f1117;color:#e8eaf0;border-radius:16px;padding:40px 36px;">
         <h2 style="margin:0 0 8px;font-size:22px;">Chat App</h2>
         <p style="color:#7a7f96;margin:0 0 32px;font-size:14px;">Your one-time code to ${action}</p>
@@ -48,12 +43,36 @@ async function sendOtpEmail(toEmail, code, type) {
         <p style="color:#7a7f96;font-size:13px;margin:0;">This code expires in <strong style="color:#e8eaf0;">10 minutes</strong>. Don't share it with anyone.</p>
       </div>
     `,
-    }),
   });
 
-  if (!response.ok) {
-    const details = await response.text();
-    throw new Error(`Brevo send failed (${response.status}): ${details}`);
+  const response = await new Promise((resolve, reject) => {
+    const req = https.request(
+      'https://api.brevo.com/v3/smtp/email',
+      {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'api-key': apiKey,
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(payload),
+        },
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => {
+          resolve({ statusCode: res.statusCode || 0, body: data });
+        });
+      }
+    );
+
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+
+  if (response.statusCode < 200 || response.statusCode >= 300) {
+    throw new Error(`Brevo send failed (${response.statusCode}): ${response.body}`);
   }
 }
 
@@ -130,7 +149,7 @@ function mountAuthRoutes(app) {
       await sendOtpEmail(key, code, 'verify');
     } catch (e) {
       console.error('Email send failed:', e.message);
-      return res.json({ ok: false, msg: 'Failed to send OTP email. Check your Brevo env vars.' });
+      return res.json({ ok: false, msg: `Failed to send OTP email: ${e.message}` });
     }
 
     return res.json({ ok: true, msg: 'OTP sent to your email.' });
@@ -207,8 +226,9 @@ function mountAuthRoutes(app) {
     storeOtp(key, code, 'verify');
     try {
       await sendOtpEmail(key, code, 'verify');
-    } catch {
-      return res.json({ ok: false, msg: 'Failed to send email.' });
+    } catch (e) {
+      console.error('Resend error:', e.message);
+      return res.json({ ok: false, msg: `Failed to send email: ${e.message}` });
     }
     return res.json({ ok: true, msg: 'New OTP sent.' });
   });
